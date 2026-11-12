@@ -1,0 +1,1476 @@
+<!DOCTYPE html>
+<html lang="id"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function () {
+  "use strict";
+  if (window.__coworkHtmlReviewGuest) return;
+  window.__coworkHtmlReviewGuest = true;
+
+  var READY_TYPE = "__cowork_html_review_ready__";
+  var SEL_CLASS = "__cwhr-sel";
+  var CONTEXT_LEN = 32;
+  var EXACT_CAP = 1000;
+  var port = null;
+  var mode = false;
+  var pins = [];
+  var quotes = [];
+  // Resolved Range per quote id; invalidated on DOM mutation and on a
+  // fresh quotes set. Scroll/resize re-reports just re-read
+  // getClientRects() from the cached Range. Null prototype - ids are
+  // collaborator-writable and must not collide with Object.prototype.
+  var quoteRanges = Object.create(null);
+  var hoverEl = null;
+  var selected = null;
+  var hasTextSel = false;
+  var rafPending = false;
+  // Capture before page body scripts can shadow them; start() defers
+  // to DOMContentLoaded which page code can race.
+  var _MessageChannel = window.MessageChannel;
+  var _topPost = window.top.postMessage.bind(window.top);
+
+  function visibleText(el) {
+    // innerText drops display:none/visibility:hidden subtrees; keep an
+    // empty innerText (icon-only el) rather than falling through to
+    // textContent which would re-include hidden text.
+    var t = typeof el.innerText === "string" ? el.innerText : (el.textContent || "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+
+  // Comment-mode cursor: see HTML_PREVIEW_COMMENT_CURSOR above.
+  var BUBBLE_CURSOR = "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";
+
+  function injectStyle() {
+    var style = document.createElement("style");
+    // Hover box is painted by the host (from streamed rects); the guest
+    // marks the selected element and, in comment mode, swaps the native
+    // cursor for the comment bubble (forced, so page cursor styles don't
+    // fight the picker). While a composer or thread card is open the arrow
+    // returns, so the bubble cursor and the pin just placed never show at
+    // once. Keyed on <html> data attributes, which page scripts that
+    // rewrite body.className leave alone; ":not(#_)" lifts the rules to
+    // id-level specificity so a page's own !important cursor rules lose.
+    var ANY = ":not(#__cwhr_)";
+    var MODE = "html[data-cwhr-mode]";
+    var COMPOSING = MODE + "[data-cwhr-composing]";
+    style.textContent =
+      "." + SEL_CLASS + "{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}" +
+      MODE + ANY + "," + MODE + " " + ANY + "{cursor:" + BUBBLE_CURSOR + " !important;}" +
+      COMPOSING + ANY + "," + COMPOSING + " " + ANY + "{cursor:default !important;}";
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function isUnique(sel) {
+    try {
+      return document.querySelectorAll(sel).length === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Mirrors the host's stripInvisibles ranges. The host strips these
+  // from stored selectors, so a selector built on a value containing
+  // them would validate here but never match again - skip those rungs
+  // and fall through to the structural ladder instead.
+  function hasInvisibles(s) {
+    for (var i = 0; i < s.length; i++) {
+      var c = s.codePointAt(i);
+      if (c > 0xffff) i++;
+      if (
+        c <= 0x1f ||
+        c === 0x061c ||
+        c === 0x070f ||
+        c === 0xad ||
+        (c >= 0x7f && c <= 0x9f) ||
+        c === 0x115f ||
+        c === 0x1160 ||
+        c === 0x180e ||
+        (c >= 0x200b && c <= 0x200f) ||
+        (c >= 0x202a && c <= 0x202e) ||
+        (c >= 0x2060 && c <= 0x2064) ||
+        (c >= 0x2066 && c <= 0x2069) ||
+        c === 0x3164 ||
+        c === 0xfeff ||
+        (c >= 0xfff9 && c <= 0xfffb) ||
+        c === 0xffa0 ||
+        (c >= 0xe0000 && c <= 0xe007f)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function escapeAttr(v) {
+    return String(v).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  // Selector ladder: unique #id -> unique [data-*] -> structural
+  // tag:nth-of-type path rooted at the nearest unique-id ancestor.
+  function selectorFor(el) {
+    if (el.id && !hasInvisibles(el.id) && isUnique("#" + CSS.escape(el.id))) {
+      return "#" + CSS.escape(el.id);
+    }
+    for (var i = 0; i < el.attributes.length; i++) {
+      var attr = el.attributes[i];
+      if (
+        attr.name.indexOf("data-") === 0 &&
+        attr.value &&
+        !hasInvisibles(attr.value)
+      ) {
+        var dataSel = "[" + attr.name + '="' + escapeAttr(attr.value) + '"]';
+        if (isUnique(dataSel)) return dataSel;
+      }
+    }
+    var parts = [];
+    var cur = el;
+    while (cur && cur !== document.body && cur.nodeType === 1 && parts.length < 10) {
+      var sel = cur.tagName.toLowerCase();
+      var parent = cur.parentElement;
+      if (parent) {
+        var sameTag = [];
+        for (var c = 0; c < parent.children.length; c++) {
+          if (parent.children[c].tagName === cur.tagName) sameTag.push(parent.children[c]);
+        }
+        if (sameTag.length > 1) {
+          sel += ":nth-of-type(" + (sameTag.indexOf(cur) + 1) + ")";
+        }
+      }
+      parts.unshift(sel);
+      if (
+        parent &&
+        parent.id &&
+        !hasInvisibles(parent.id) &&
+        isUnique("#" + CSS.escape(parent.id))
+      ) {
+        parts.unshift("#" + CSS.escape(parent.id));
+        return parts.join(" > ");
+      }
+      cur = parent;
+    }
+    if (cur === document.body) {
+      parts.unshift("body");
+      return parts.join(" > ");
+    }
+    // Depth cap hit without a root - an unrooted chain would match the
+    // first structural pattern anywhere in the document. Mark the pin
+    // detached instead of attaching it to the wrong element.
+    return ":not(*)";
+  }
+
+  function descriptorFor(el) {
+    var tag = "<" + el.tagName.toLowerCase() + ">";
+    var idPart = el.id ? " #" + el.id : "";
+    var text = visibleText(el).slice(0, 60);
+    var textPart = text ? ' "' + text + '"' : "";
+    // Nearest id'd ancestor, skipping the UCR-injected
+    // #artifacts-component-root-* wrapper which is implementation noise.
+    var section = el.parentElement;
+    while (
+      section &&
+      (!section.id || section.id.indexOf("artifacts-component-root") === 0)
+    ) {
+      section = section.parentElement;
+    }
+    var sectionPart = section && section.id ? " in #" + section.id : "";
+    return (tag + idPart + textPart + sectionPart).slice(0, 400);
+  }
+
+  // textContent offset of (node, offset) within body - the coordinate
+  // system text-quote anchors are stored in. -1 when the boundary
+  // isn't under body (shadow root, detached).
+  function textOffset(node, offset) {
+    var body = document.body;
+    if (!body) return -1;
+    try {
+      var pre = document.createRange();
+      pre.selectNodeContents(body);
+      pre.setEnd(node, offset);
+      return pre.toString().length;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  // Inverse: build a Range covering [start, end) in body.textContent.
+  function rangeForOffsets(start, end) {
+    var body = document.body;
+    if (!body) return null;
+    var walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    var acc = 0;
+    var range = document.createRange();
+    var haveStart = false;
+    var t;
+    while ((t = walker.nextNode())) {
+      var next = acc + t.length;
+      if (!haveStart && start < next) {
+        range.setStart(t, start - acc);
+        haveStart = true;
+      }
+      if (haveStart && end <= next) {
+        range.setEnd(t, end - acc);
+        return range;
+      }
+      acc = next;
+    }
+    return null;
+  }
+
+  // Context-scored search (W3C text-quote resolution): slice-check the
+  // hint, else pick the occurrence whose surrounding chars best match
+  // prefix/suffix. MIRRORS locateTextQuote() above line-for-line - the
+  // tested export is the contract; this copy is what the sandbox runs.
+  function locateQuote(text, q) {
+    var ex = q.exact;
+    if (!ex) return null;
+    var hint = q.startOffset >= 0 ? q.startOffset : 0;
+    if (text.slice(hint, hint + ex.length) === ex) {
+      return { start: hint, end: hint + ex.length };
+    }
+    var best = -1;
+    var bestScore = -1;
+    var bestDist = Infinity;
+    var scanned = 0;
+    for (var idx = text.indexOf(ex); idx !== -1 && ++scanned <= 1000; idx = text.indexOf(ex, idx + 1)) {
+      var before = text.slice(Math.max(0, idx - CONTEXT_LEN), idx);
+      var after = text.slice(idx + ex.length, idx + ex.length + CONTEXT_LEN);
+      var sc = 0;
+      for (var i = 1; i <= q.prefix.length && i <= before.length; i++) {
+        if (q.prefix[q.prefix.length - i] !== before[before.length - i]) break;
+        sc++;
+      }
+      for (var j = 0; j < q.suffix.length && j < after.length; j++) {
+        if (q.suffix[j] !== after[j]) break;
+        sc++;
+      }
+      var dist = Math.abs(idx - hint);
+      if (sc > bestScore || (sc === bestScore && dist < bestDist)) {
+        best = idx;
+        bestScore = sc;
+        bestDist = dist;
+      }
+    }
+    return best === -1 ? null : { start: best, end: best + ex.length };
+  }
+
+  function collectLineRects(range, cap) {
+    var out = [];
+    var rects = range.getClientRects();
+    for (var i = 0; i < rects.length && out.length < cap; i++) {
+      var r = rects[i];
+      if (r.width > 0 && r.height > 0) {
+        out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+      }
+    }
+    return out;
+  }
+
+  function reportTextSel(full) {
+    if (!port) return;
+    var sel = window.getSelection();
+    var r = sel && !sel.isCollapsed && sel.rangeCount > 0 ? sel.getRangeAt(0) : null;
+    if (!r || !document.body || !document.body.contains(r.commonAncestorContainer)) {
+      if (hasTextSel) {
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+      }
+      return;
+    }
+    hasTextSel = true;
+    var br = r.getBoundingClientRect();
+    var msg = {
+      type: "textCapture",
+      rect: { x: br.left, y: br.top, w: br.width, h: br.height },
+      lineRects: collectLineRects(r, 80),
+    };
+    if (full) {
+      var live = document.body.textContent || "";
+      var so = textOffset(r.startContainer, r.startOffset);
+      var eo = textOffset(r.endContainer, r.endOffset);
+      if (so < 0 || eo < 0 || eo <= so) {
+        // Unanchorable selection (shadow root, foreign node). A
+        // rect-only post here would make the host pair the new rect
+        // with a stale prior anchor - clear instead.
+        hasTextSel = false;
+        port.postMessage({ type: "textClear" });
+        return;
+      }
+      // Denomination invariant: exact/prefix/suffix are byte-identical
+      // slices of body.textContent. Truncation adjusts endOffset so
+      // the host's (endOffset - startOffset === exact.length) shape
+      // check holds. Cut points back off surrogate halves - a lone
+      // surrogate would never relocate and fails UTF-8 persist.
+      var capped = Math.min(eo, so + EXACT_CAP);
+      if (capped < eo) {
+        var hc = live.charCodeAt(capped - 1);
+        if (hc >= 0xd800 && hc <= 0xdbff) capped--;
+      }
+      if (capped <= so) {
+        port.postMessage(msg);
+        return;
+      }
+      var pStart = Math.max(0, so - CONTEXT_LEN);
+      var pc = live.charCodeAt(pStart);
+      if (pc >= 0xdc00 && pc <= 0xdfff) pStart++;
+      var sEnd = Math.min(live.length, capped + CONTEXT_LEN);
+      if (sEnd < live.length) {
+        var sc = live.charCodeAt(sEnd - 1);
+        if (sc >= 0xd800 && sc <= 0xdbff) sEnd--;
+      }
+      msg.exact = live.slice(so, capped);
+      msg.prefix = live.slice(pStart, so);
+      msg.suffix = live.slice(capped, sEnd);
+      msg.startOffset = so;
+      msg.endOffset = capped;
+    }
+    port.postMessage(msg);
+  }
+
+  function clearSelection() {
+    if (selected) {
+      selected.classList.remove(SEL_CLASS);
+      selected = null;
+    }
+  }
+
+  // rAF-throttled cursor + hover-rect stream so the host can paint the
+  // inspector hover box (and knows the pointer is present) in comment mode.
+  var cursorPending = false;
+  var cursorX = -1;
+  var cursorY = -1;
+  function flushCursor() {
+    cursorPending = false;
+    if (!port) return;
+    var hover = null;
+    if (
+      hoverEl &&
+      hoverEl.nodeType === 1 &&
+      hoverEl !== document.body &&
+      hoverEl !== document.documentElement
+    ) {
+      var r = hoverEl.getBoundingClientRect();
+      if (r.width > 0 || r.height > 0) {
+        hover = { x: r.left, y: r.top, w: r.width, h: r.height };
+      }
+    }
+    port.postMessage({ type: "cursor", x: cursorX, y: cursorY, hover: hover });
+  }
+  function scheduleCursor() {
+    if (!cursorPending) {
+      cursorPending = true;
+      requestAnimationFrame(flushCursor);
+    }
+  }
+  function onMouseMove(ev) {
+    if (!mode || !port) return;
+    // Over the scrollbar gutter (clientX/Y past the content box) - hide
+    // the hover box like a leave.
+    var de = document.documentElement;
+    if (ev.clientX >= de.clientWidth || ev.clientY >= de.clientHeight) {
+      cursorX = -1;
+      cursorY = -1;
+      hoverEl = null;
+      scheduleCursor();
+      return;
+    }
+    cursorX = ev.clientX;
+    cursorY = ev.clientY;
+    hoverEl = ev.target;
+    scheduleCursor();
+  }
+  function onMouseLeave() {
+    if (!mode || !port) return;
+    cursorX = -1;
+    cursorY = -1;
+    hoverEl = null;
+    scheduleCursor();
+  }
+
+  function onClick(ev) {
+    if (!port) return;
+    if (!mode) {
+      // Mode off: don't intercept the page, just let the host close any
+      // open popover (thread card click-away). A non-collapsed selection
+      // means the click ended a drag-select - not a click-away.
+      var s = window.getSelection();
+      if (!s || s.isCollapsed) port.postMessage({ type: "clickAway" });
+      return;
+    }
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1 || el === document.documentElement) return;
+    if (el === document.body && el.firstElementChild) {
+      // Pin on body is rarely intentional; keep it anyway but as body.
+    }
+    clearSelection();
+    selected = el;
+    el.classList.add(SEL_CLASS);
+    var rect = el.getBoundingClientRect();
+    var pinX = rect.width > 0 ? (ev.clientX - rect.left) / rect.width : 0.5;
+    var pinY = rect.height > 0 ? (ev.clientY - rect.top) / rect.height : 0.5;
+    port.postMessage({
+      type: "capture",
+      selector: selectorFor(el).slice(0, 1000),
+      textHint: visibleText(el).slice(0, 300),
+      descriptor: descriptorFor(el),
+      pinX: Math.min(1, Math.max(0, pinX)),
+      pinY: Math.min(1, Math.max(0, pinY)),
+      clientX: ev.clientX,
+      clientY: ev.clientY,
+      rectLeft: rect.left,
+      rectTop: rect.top,
+    });
+  }
+
+  function reportRects() {
+    rafPending = false;
+    if (!port) return;
+    // Selected element's live bounds - keeps the host's draft pin /
+    // inspector tag / composer glued through scroll and reflow.
+    if (selected) {
+      var sr = selected.getBoundingClientRect();
+      port.postMessage({
+        type: "selRect",
+        left: sr.left,
+        top: sr.top,
+        w: sr.width,
+        h: sr.height,
+        found:
+          (sr.width > 0 || sr.height > 0) &&
+          document.documentElement.contains(selected),
+      });
+    }
+    var rects = [];
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i];
+      var el = null;
+      try {
+        el = document.querySelector(p.selector);
+      } catch (e) {
+        el = null;
+      }
+      if (!el) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      var r = el.getBoundingClientRect();
+      if (r.width === 0 && r.height === 0) {
+        rects.push({ id: p.id, x: 0, y: 0, found: false });
+        continue;
+      }
+      rects.push({
+        id: p.id,
+        x: r.left + p.pinX * r.width,
+        y: r.top + p.pinY * r.height,
+        found: true,
+      });
+    }
+    var quoteRects = [];
+    if (quotes.length > 0) {
+      var live = null;
+      for (var qi = 0; qi < quotes.length; qi++) {
+        var q = quotes[qi];
+        var qr = quoteRanges[q.id];
+        if (qr === undefined) {
+          if (live === null) {
+            live = (document.body && document.body.textContent) || "";
+          }
+          var loc = locateQuote(live, q);
+          qr = (loc && rangeForOffsets(loc.start, loc.end)) || null;
+          quoteRanges[q.id] = qr;
+        }
+        // Zero paintable rects (display:none subtree) reports as
+        // not-found so the host docks it as detached instead of
+        // rendering nothing clickable.
+        var qlr = qr ? collectLineRects(qr, 80) : [];
+        quoteRects.push(
+          qlr.length > 0
+            ? { id: q.id, found: true, lineRects: qlr }
+            : { id: q.id, found: false, lineRects: [] }
+        );
+      }
+    }
+    port.postMessage({
+      type: "rects",
+      rects: rects,
+      quoteRects: quoteRects,
+      scrollY: window.scrollY || 0,
+    });
+  }
+
+  function scheduleRects() {
+    if (rafPending) return;
+    rafPending = true;
+    var done = false;
+    function run() {
+      if (done) return;
+      done = true;
+      reportRects();
+    }
+    // rAF for paint alignment, with a timeout fallback - rAF is
+    // suspended entirely in hidden tabs and pins must still settle
+    // when the tab becomes visible after background loading.
+    requestAnimationFrame(run);
+    setTimeout(run, 150);
+  }
+
+  function setMode(on) {
+    mode = !!on;
+    document.documentElement.toggleAttribute("data-cwhr-mode", mode);
+    if (!mode) {
+      hoverEl = null;
+      clearSelection();
+    }
+  }
+
+  function setComposing(open) {
+    document.documentElement.toggleAttribute("data-cwhr-composing", !!open);
+  }
+
+  function onPortMessage(ev) {
+    var data = ev.data;
+    if (!data) return;
+    if (data.type === "mode") setMode(data.on);
+    else if (data.type === "composing") setComposing(data.open);
+    else if (data.type === "pins") {
+      pins = Array.isArray(data.pins) ? data.pins : [];
+      scheduleRects();
+    } else if (data.type === "quotes") {
+      quotes = Array.isArray(data.quotes) ? data.quotes : [];
+      quoteRanges = Object.create(null);
+      scheduleRects();
+    } else if (data.type === "clearSelection") {
+      clearSelection();
+    } else if (data.type === "clearTextSel") {
+      var ts = window.getSelection();
+      if (ts) ts.removeAllRanges();
+      hasTextSel = false;
+    } else if (data.type === "restoreScroll") {
+      var ry = Number(data.y);
+      if (isFinite(ry) && ry > 0) {
+        // Apply now and again at load - late images/fonts can grow the
+        // document after the first attempt clamps short.
+        window.scrollTo(0, ry);
+        window.addEventListener("load", function () {
+          window.scrollTo(0, ry);
+        });
+      }
+    }
+  }
+
+  function start() {
+    injectStyle();
+    var channel = new _MessageChannel();
+    port = channel.port1;
+    port.onmessage = onPortMessage;
+    // Sandboxed srcdoc origins can be opaque; "*" is required. The
+    // payload carries only the mount token (multiple sandboxes can be
+    // mounted at once - the token routes the port to the right overlay)
+    // and the channel port itself is pairwise-secure.
+    _topPost(
+      { type: READY_TYPE, token: "22f3bbe5-4525-43f3-ba66-90ccefad710e" },
+      "*",
+      [channel.port2]
+    );
+    document.addEventListener("mousemove", onMouseMove, true);
+    // documentElement (not document, capture) so this fires only when the
+    // pointer leaves the viewport - capture-phase on document would fire for
+    // every intra-document element-boundary crossing.
+    document.documentElement.addEventListener("mouseleave", onMouseLeave);
+    document.addEventListener("click", onClick, true);
+    // Text-selection capture: commit on mouseup/keyup (Shift+Arrow),
+    // clear on collapse. Not mode-gated; highlight-to-comment is
+    // always on.
+    function onSelCommit() { reportTextSel(true); }
+    document.addEventListener("mouseup", onSelCommit, true);
+    document.addEventListener("keyup", onSelCommit, true);
+    document.addEventListener("selectionchange", function () {
+      var s = window.getSelection();
+      if (hasTextSel && (!s || s.isCollapsed)) reportTextSel(false);
+    });
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape" && port) port.postMessage({ type: "dismiss" });
+    }, true);
+    // Scroll/resize move the hovered element under a stationary pointer -
+    // re-report its rect so the host's inspector box tracks it. Mutations
+    // stay rects-only (animating pages would chatter the cursor stream).
+    var textSelPending = false;
+    function scheduleTextSel() {
+      if (textSelPending) return;
+      textSelPending = true;
+      requestAnimationFrame(function () {
+        textSelPending = false;
+        reportTextSel(false);
+      });
+    }
+    function onLayoutChange() {
+      scheduleRects();
+      if (mode && hoverEl) scheduleCursor();
+      if (hasTextSel) scheduleTextSel();
+    }
+    window.addEventListener("scroll", onLayoutChange, true);
+    window.addEventListener("resize", onLayoutChange);
+    // Full-cache invalidate per childList mutation is acceptable: CSS
+    // animation doesn't fire the observer; JS writers at frame rate
+    // would re-relocate every frame but are rare. characterData isn't
+    // observed, so .data= edits leave highlights stale until the next
+    // childList mutation.
+    var observer = new MutationObserver(function () {
+      quoteRanges = Object.create(null);
+      scheduleRects();
+      if (hasTextSel) scheduleTextSel();
+    });
+    function observe() {
+      if (document.body) observer.observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) observe();
+    else document.addEventListener("DOMContentLoaded", observe);
+    // Settle pins after late layout (fonts, images).
+    setInterval(scheduleRects, 2000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
+  }
+})();
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Battle Royale: Last Survivor</title>
+<style>
+*{box-sizing:border-box;margin:0;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none;touch-action:none}
+html,body{height:100%;overflow:hidden;background:#0b1a22;font-family:"Trebuchet MS","Segoe UI",system-ui,sans-serif;color:#eaf7ef}
+canvas#g{position:fixed;inset:0;width:100%;height:100%}
+#hud{position:fixed;inset:0;pointer-events:none;display:none}
+.pill{position:absolute;top:10px;left:10px;display:flex;gap:8px}
+.pill div{background:rgba(6,16,22,.7);border:1px solid rgba(255,255,255,.2);padding:6px 12px;border-radius:99px;font-weight:700}
+.pill b{color:#ffd23f}
+#feed{position:absolute;top:50px;left:10px;font-size:.85rem;line-height:1.5;text-shadow:0 1px 3px #000}
+#mm{position:absolute;top:10px;right:10px;width:110px;height:110px;border-radius:50%;border:2px solid rgba(255,255,255,.4);background:rgba(6,16,22,.6)}
+#cross{position:absolute;left:50%;top:50%;width:22px;height:22px;transform:translate(-50%,-50%)}
+#cross:before,#cross:after{content:"";position:absolute;background:#fff;box-shadow:0 0 3px #000}
+#cross:before{left:10px;top:0;width:2px;height:22px;clip-path:polygon(0 0,100% 0,100% 35%,0 35%,0 65%,100% 65%,100% 100%,0 100%)}
+#cross:after{top:10px;left:0;height:2px;width:22px;clip-path:polygon(0 0,35% 0,35% 100%,0 100%,65% 0,100% 0,100% 100%,65% 100%)}
+#hit{position:absolute;left:50%;top:50%;width:34px;height:34px;border:3px solid #ff4d4d;transform:translate(-50%,-50%) rotate(45deg);opacity:0;transition:opacity .15s}
+#vig{position:absolute;inset:0;box-shadow:inset 0 0 120px 30px rgba(220,0,0,.85);opacity:0;transition:opacity .25s}
+#bars{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);width:min(300px,52vw)}
+.bar{height:14px;border-radius:99px;background:rgba(0,0,0,.55);overflow:hidden;border:1px solid rgba(255,255,255,.25)}
+.bar i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#e63946,#ff8a5c);transition:width .15s}
+#hpt{font-size:.8rem;font-weight:700;text-align:center;margin-bottom:3px;text-shadow:0 1px 3px #000}
+#ammo{position:absolute;right:14px;bottom:150px;text-align:right;text-shadow:0 2px 5px #000}
+#ammo b{font-size:2rem;color:#ffd23f}
+#ammo div{font-weight:800;font-size:.95rem}
+#toast{position:absolute;left:50%;top:30%;transform:translateX(-50%);font-weight:800;font-size:1.15rem;text-shadow:0 2px 6px #000;opacity:0;transition:opacity .3s;white-space:nowrap}
+#zmsg{position:absolute;left:50%;top:10px;transform:translateX(-50%);background:rgba(230,57,70,.85);padding:5px 12px;border-radius:99px;font-weight:700;font-size:.8rem;max-width:44vw;text-align:center}
+#touch{position:fixed;inset:0;display:none}
+#jz{position:absolute;left:0;bottom:0;width:45%;height:60%}
+#lz{position:absolute;right:0;top:0;width:55%;height:100%}
+.knob,.base{position:fixed;border-radius:50%;transform:translate(-50%,-50%);display:none;pointer-events:none}
+.base{width:120px;height:120px;border:2px solid rgba(255,255,255,.35);background:rgba(255,255,255,.08)}
+.knob{width:56px;height:56px;background:rgba(255,255,255,.35);border:2px solid rgba(255,255,255,.7)}
+.tb{position:absolute;border-radius:50%;background:rgba(255,255,255,.16);border:2px solid rgba(255,255,255,.5);font-size:1.4rem;display:flex;align-items:center;justify-content:center;color:#fff;touch-action:none}
+#bf{right:22px;bottom:34px;width:92px;height:92px;background:rgba(255,90,50,.45);font-size:2rem}
+#bj{right:130px;bottom:30px;width:62px;height:62px}
+#br{right:30px;bottom:140px;width:56px;height:56px}
+#bs{right:100px;bottom:105px;width:56px;height:56px}
+#ov{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;background:radial-gradient(circle at 50% 30%,rgba(18,80,70,.9),rgba(4,12,16,.97))}
+h1{font-family:Georgia,serif;font-size:clamp(2.4rem,10vw,4.4rem);line-height:1}
+h1 span{color:#ff6b35}
+#ov p{max-width:46ch;line-height:1.55;opacity:.9;margin:14px 0}
+.big{font-size:3rem;font-weight:900;color:#ffd23f;font-family:Georgia,serif}
+button{font:inherit;cursor:pointer;border:0;color:inherit}
+.btn{background:linear-gradient(135deg,#ff6b35,#ffb02e);color:#1a0f08;font-weight:800;font-size:1.2rem;padding:14px 38px;border-radius:99px;box-shadow:0 7px 0 #a8401a,0 12px 22px rgba(0,0,0,.4)}
+.btn:active{transform:translateY(5px);box-shadow:0 2px 0 #a8401a}
+.btn.g{background:rgba(255,255,255,.1);color:#eaf7ef;box-shadow:none;font-size:.95rem;padding:10px 20px;border:1px solid rgba(255,255,255,.3);margin-top:16px}
+.keys{font-size:.82rem;opacity:.7}
+#sens{width:180px;vertical-align:middle;touch-action:pan-x}
+.sl{font-size:.9rem;margin-bottom:10px;display:block}
+.sb{margin-bottom:4px}.sb i{background:linear-gradient(90deg,#2a9df4,#8fdcff)}
+#bg{right:165px;bottom:105px;width:54px;height:54px}
+#gr{font-size:1rem;font-weight:800}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<canvas id="g"></canvas>
+<div id="hud">
+ <div class="pill"><div>Hidup <b id="al">16</b></div><div>Kill <b id="kl">0</b></div></div>
+ <div id="zmsg"></div><div id="feed"></div>
+ <canvas id="mm" width="110" height="110"></canvas>
+ <div id="cross"></div><div id="hit"></div><div id="vig"></div><div id="toast"></div>
+ <div id="ammo"><div id="wn"></div><div id="gr"></div><b id="am">12</b> <span id="rs"></span></div>
+ <div id="bars"><div id="hpt">100</div><div class="bar sb"><i id="shb" style="width:0"></i></div><div class="bar"><i id="hpb"></i></div></div>
+</div>
+<div id="touch">
+ <div id="jz"></div><div id="lz"></div>
+ <div class="tb" id="bf">🔫</div><div class="tb" id="bj">⤒</div><div class="tb" id="br">↻</div><div class="tb" id="bs">⇄</div><div class="tb" id="bg">💣</div>
+</div>
+<div class="base" id="jb"></div><div class="knob" id="jk"></div>
+
+<div id="ov">
+ <h1>BATTLE ROYALE<br><span>LAST SURVIVOR</span></h1>
+ <p id="sub">16 pemain terjun payung ke pulau luas. Cari senjata, armor, dan granat di sekitar rumah, hindari zona merah yang menyusut, lalu jadilah survivor terakhir.</p>
+ <div class="big" id="bigv" style="display:none"></div>
+ <label class="sl">Sensitivitas bidik <input type="range" id="sens" min=".5" max="2" step=".1" value="1"></label>
+ <button class="btn g" id="snd" style="margin:0 0 14px">🔊 Suara: nyala</button>
+ <button class="btn" id="play">MAIN</button>
+ <button class="btn g" id="dl">⬇ Unduh game (file HTML)</button>
+ <p class="keys">PC: WASD gerak, Shift lari, Spasi lompat, mouse bidik, klik tembak, R reload, 1/2/3 atau Q ganti senjata, G lempar granat.<br>HP: joystick kiri gerak, geser layar kanan untuk bidik, tombol 🔫 tembak, 💣 granat.<br>Butuh internet saat pertama dibuka untuk memuat Three.js.</p>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const SRC='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
+const $=id=>document.getElementById(id);
+const rnd=(a,b)=>a+Math.random()*(b-a),cl=(v,a,b)=>Math.max(a,Math.min(b,v));
+const touch=('ontouchstart' in window)||navigator.maxTouchPoints>0;
+const WP={
+ pistol:{n:'Pistol',d:22,r:.35,mag:12,rl:1.2,p:1,sp:.008,rg:130,col:0xcfd8dc},
+ shotgun:{n:'Shotgun',d:11,r:.9,mag:6,rl:2.2,p:7,sp:.07,rg:45,col:0xff9f1c},
+ rifle:{n:'Rifle',d:17,r:.12,mag:30,rl:1.8,p:1,sp:.018,rg:170,col:0x4dabf7}};
+const ORDER=['pistol','shotgun','rifle'];
+const NAMES=['Raka','Sari','Bima','Dewi','Joko','Putri','Arga','Nanda','Tegar','Mira','Fajar','Lintang','Surya','Wulan','Dimas'];
+let ac,sound=true;
+function tone(f,d,t='square',v=.04){if(!sound)return;try{ac=ac||new(window.AudioContext||window.webkitAudioContext)();const o=ac.createOscillator(),g=ac.createGain();o.type=t;o.frequency.value=f;g.gain.setValueAtTime(v,ac.currentTime);g.gain.exponentialRampToValueAtTime(.001,ac.currentTime+d);o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+d)}catch(e){}}
+
+if(typeof THREE==='undefined'){$('sub').textContent='Three.js gagal dimuat. Periksa koneksi internet lalu muat ulang halaman.';$('play').style.display='none'}
+else{
+const renderer=new THREE.WebGLRenderer({canvas:$('g'),antialias:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x8fd3f4);scene.fog=new THREE.Fog(0x8fd3f4,60,260);
+const cam=new THREE.PerspectiveCamera(70,1,.1,500);cam.rotation.order='YXZ';
+scene.add(new THREE.HemisphereLight(0xffffff,0x4a6a4a,.85));
+const sun=new THREE.DirectionalLight(0xfff0d0,.8);sun.position.set(80,140,60);scene.add(sun);
+const M=(c)=>new THREE.MeshLambertMaterial({color:c,flatShading:true});
+function box(w,h,d,c){return new THREE.Mesh(new THREE.BoxGeometry(w,h,d),M(c))}
+function resize(){renderer.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}
+addEventListener('resize',resize);resize();
+
+// dunia
+const sea=new THREE.Mesh(new THREE.PlaneGeometry(2400,2400),new THREE.MeshLambertMaterial({color:0x1d7fb8}));sea.rotation.x=-Math.PI/2;sea.position.y=-.4;scene.add(sea);
+const sand=new THREE.Mesh(new THREE.CircleGeometry(402,48),M(0xe8d9a0));sand.rotation.x=-Math.PI/2;sand.position.y=-.1;scene.add(sand);
+const grass=new THREE.Mesh(new THREE.CircleGeometry(375,48),M(0x4f9a52));grass.rotation.x=-Math.PI/2;scene.add(grass);
+const zoneM=new THREE.Mesh(new THREE.CylinderGeometry(1,1,70,64,1,true),new THREE.MeshBasicMaterial({color:0xff2a3a,transparent:true,opacity:.28,side:THREE.DoubleSide,depthWrite:false}));zoneM.position.y=35;scene.add(zoneM);
+const obs=[],cols=[],houses=[];
+function house(x,z,w,d,h,c){const m=box(w,h,d,c);m.position.set(x,h/2,z);scene.add(m);obs.push(m);
+ cols.push({x0:x-w/2,x1:x+w/2,z0:z-d/2,z1:z+d/2});houses.push({x,z});
+ const r=new THREE.Mesh(new THREE.ConeGeometry(Math.max(w,d)*.75,h*.55,4),M(0x9b3d2e));r.rotation.y=Math.PI/4;r.position.set(x,h+h*.27,z);scene.add(r);
+ const dr=box(2,2.4,.3,0x2b2118);dr.position.set(x,1.2,z+d/2+.1);scene.add(dr);
+ const wn=box(2.2,1.4,.3,0xbfe9ff);wn.position.set(x+w/4,2.6,z+d/2+.1);scene.add(wn)}
+function free(x,z,m){for(const c of cols)if(x>c.x0-m&&x<c.x1+m&&z>c.z0-m&&z<c.z1+m)return false;return true}
+const HC=[0xd9c7a3,0xb8c4d6,0xe3b8a8,0xa9c9a4,0xd6d1c4];
+for(let k=0,t=0;k<22&&t<400;t++){const a=rnd(0,6.28),r=Math.sqrt(Math.random())*330,x=Math.cos(a)*r,z=Math.sin(a)*r,w=rnd(9,16),d=rnd(8,13);
+ if(free(x,z,w+10)){house(x,z,w,d,rnd(4,6),HC[k%5]);k++}}
+house(0,0,22,16,7,0xc9b79a);
+for(let k=0,t=0;k<170&&t<1500;t++){const a=rnd(0,6.28),r=Math.sqrt(Math.random())*368,x=Math.cos(a)*r,z=Math.sin(a)*r;
+ if(!free(x,z,3))continue;k++;const h=rnd(4,7);
+ const tr=new THREE.Mesh(new THREE.CylinderGeometry(.3,.45,h*.5,6),M(0x6b4a2b));tr.position.set(x,h*.25,z);scene.add(tr);
+ const c1=new THREE.Mesh(new THREE.ConeGeometry(2.1,h*.7,7),M(0x2e7d4f));c1.position.set(x,h*.7,z);scene.add(c1);
+ const c2=new THREE.Mesh(new THREE.ConeGeometry(1.5,h*.5,7),M(0x37935c));c2.position.set(x,h*1.05,z);scene.add(c2);
+ cols.push({x0:x-.5,x1:x+.5,z0:z-.5,z1:z+.5})}
+for(let k=0;k<40;k++){const a=rnd(0,6.28),r=rnd(0,360),x=Math.cos(a)*r,z=Math.sin(a)*r;if(!free(x,z,2))continue;const s=rnd(.6,1.8);const m=new THREE.Mesh(new THREE.DodecahedronGeometry(s),M(0x8a8f94));m.position.set(x,s*.5,z);scene.add(m);cols.push({x0:x-s*.7,x1:x+s*.7,z0:z-s*.7,z1:z+s*.7})}
+function push(p,r){for(const c of cols){const cx=cl(p.x,c.x0,c.x1),cz=cl(p.z,c.z0,c.z1);let dx=p.x-cx,dz=p.z-cz,d=Math.hypot(dx,dz);if(d<r){if(d<1e-4){dx=1;dz=0;d=1}p.x+=dx/d*(r-d);p.z+=dz/d*(r-d)}}
+ const q=Math.hypot(p.x,p.z);if(q>392){p.x*=392/q;p.z*=392/q}}
+
+// karakter
+function human(col){const g=new THREE.Group();
+ const b=new THREE.Mesh(new THREE.CylinderGeometry(.42,.38,1.2,8),M(col));b.position.y=.95;g.add(b);
+ const lg=new THREE.Mesh(new THREE.CylinderGeometry(.34,.3,.5,8),M(0x2b3440));lg.position.y=.25;g.add(lg);
+ const h=new THREE.Mesh(new THREE.SphereGeometry(.28,10,8),M(0xf0c9a0));h.position.y=1.8;g.add(h);
+ const gun=box(.14,.18,.9,0x222);gun.position.set(.3,1.25,-.55);g.add(gun);g.userData.gun=gun;scene.add(g);return g}
+
+// state
+let st='menu',pl,bots,items,Z,zm,zt,phase,zFrom,zTo,kills,alive,feed,now=0,last=0,tracers=[];
+const keys={},grens=[],SENS=()=>parseFloat($('sens').value)||1;let fireHeld=false,jx=0,jy=0,sprintT=false,yaw=0,pitch=0;
+function mkEnt(bot,col,wn){let x,z;do{const a=rnd(0,6.28),r=Math.sqrt(Math.random())*330;x=Math.cos(a)*r;z=Math.sin(a)*r}while(!free(x,z,4));
+ return{x,y:0,z,vy:0,hp:100,bot,dead:false,w:wn,mesh:human(col),next:0,k:0,tx:x,tz:z,tt:0,sd:Math.random()<.5?1:-1,name:'',yaw:rnd(0,6.28)}}
+function init(){
+ grens.forEach(g=>scene.remove(g.m));grens.length=0;if(pl){scene.remove(pl.mesh);bots.forEach(b=>scene.remove(b.mesh));items.forEach(i=>scene.remove(i.mesh))}
+ pl=mkEnt(false,0xffd23f,'pistol');pl.name='Kamu';pl.have={pistol:true,shotgun:false,rifle:false};pl.mag={pistol:12,shotgun:0,rifle:0};pl.res={pistol:60,shotgun:0,rifle:0};pl.rl=0;pl.cur='pistol';pl.sh=0;pl.gr=2;pl.can=new THREE.Mesh(new THREE.SphereGeometry(2.4,14,8,0,6.29,0,1.5),M(0xff6b35));pl.can.position.y=3.2;pl.can.visible=false;pl.mesh.add(pl.can);
+ bots=[];for(let k=0;k<15;k++){const b=mkEnt(true,new THREE.Color().setHSL(k/15,.65,.55).getHex(),['pistol','rifle','rifle','shotgun'][k%4]);b.name=NAMES[k];bots.push(b)}
+ items=[];for(let k=0;k<85;k++){let x,z,t=0;do{const h=houses[Math.floor(Math.random()*houses.length)],a=rnd(0,6.28);x=h.x+Math.cos(a)*rnd(9,18);z=h.z+Math.sin(a)*rnd(9,18);t++}while((!free(x,z,1.5)||Math.hypot(x,z)>380)&&t<30);
+  const r=Math.random(),type=r<.2?'shotgun':r<.38?'rifle':r<.58?'med':r<.72?'arm':r<.84?'gren':'ammo';
+  const col={shotgun:0xff9f1c,rifle:0x4dabf7,med:0xff4d6d,arm:0x2ec4a0,gren:0x6b7a6b,ammo:0xffe066}[type];
+  const m=box(.9,.5,.5,col);m.position.set(x,1,z);scene.add(m);items.push({x,z,type,mesh:m})}
+ Z={x:0,z:0,r:395};zm='wait';zt=0;phase=0;kills=0;alive=16;feed=[];yaw=pl.yaw;pitch=-.1;
+}
+function say(s){feed.push({t:now,s});if(feed.length>4)feed.shift()}
+function toast(s){const e=$('toast');e.textContent=s;e.style.opacity=1;clearTimeout(toast.h);toast.h=setTimeout(()=>e.style.opacity=0,1200)}
+function hurt(e,d,by){if(e.dead)return;const ab=Math.min(e.sh||0,d);e.sh=(e.sh||0)-ab;e.hp-=d-ab;
+ if(e===pl){$('vig').style.opacity=1;setTimeout(()=>$('vig').style.opacity=0,200);tone(110,.1,'sawtooth',.05)}
+ else if(by===pl){$('hit').style.opacity=1;setTimeout(()=>$('hit').style.opacity=0,120);tone(900,.05,'triangle',.05)}
+ if(e.hp<=0){e.hp=0;e.dead=true;e.rank=alive;alive--;e.mesh.rotation.x=-1.4;e.mesh.position.y=.3;
+  if(by){by.k++;if(by===pl){kills++;toast('Kamu menyingkirkan '+e.name)}}
+  say(by?`${by.name} ➜ ${e.name}`:`${e.name} tersengat zona`);
+  if(e===pl)setTimeout(()=>end(false),1500)}}
+
+const rc=new THREE.Raycaster(),V=THREE.Vector3;
+function shoot(o,d,wn,owner,spread,mul,muzzle){const w=WP[wn];
+ for(let k=0;k<w.p;k++){const dir=d.clone().add(new V(rnd(-1,1),rnd(-1,1),rnd(-1,1)).multiplyScalar(w.sp+spread)).normalize();
+  rc.set(o,dir);rc.far=w.rg;const h=rc.intersectObjects(obs,false)[0];let tmax=h?h.distance:w.rg,best=null,bt=tmax,head=false;
+  for(const e of [pl,...bots]){if(e.dead||e===owner)continue;
+   for(const [yy,rr,hd] of [[1.0,.62,false],[1.8,.32,true]]){const c=new V(e.x,e.y+yy,e.z).sub(o),t=c.dot(dir);if(t<0||t>bt)continue;
+    if(c.sub(dir.clone().multiplyScalar(t)).length()<rr){bt=t;best=e;head=hd}}}
+  if(best)hurt(best,w.d*mul*(head?1.8:1),owner);
+  const a=muzzle||o,b=o.clone().add(dir.clone().multiplyScalar(bt));
+  const ln=new THREE.Line(new THREE.BufferGeometry().setFromPoints([a,b]),new THREE.LineBasicMaterial({color:0xffe27a}));scene.add(ln);tracers.push({ln,t:now+.06})}
+ const dist=owner===pl?0:Math.hypot(owner.x-pl.x,owner.z-pl.z);
+ if(owner===pl||dist<70)tone(wn==='shotgun'?90:wn==='rifle'?160:220,.09,'square',owner===pl?.06:.025)}
+
+function grenade(o,v,owner){const m=new THREE.Mesh(new THREE.SphereGeometry(.22,8,6),M(0x3b4a3b));m.position.copy(o);scene.add(m);grens.push({m,x:o.x,y:o.y,z:o.z,vx:v.x,vy:v.y,vz:v.z,t:now+2,owner})}
+function throwG(){if(st!=='play'||pl.dead||pl.para||pl.gr<=0||now<(pl.gn||0))return;pl.gr--;pl.gn=now+.8;const d=new V(0,0,-1).applyQuaternion(cam.quaternion);grenade(new V(pl.x,pl.y+1.5,pl.z),d.multiplyScalar(22).add(new V(0,6,0)),pl);tone(300,.08,'triangle',.06)}
+function boom(g){const r=9;for(const e of [pl,...bots]){if(e.dead)continue;const d=Math.hypot(e.x-g.x,e.y+1-g.y,e.z-g.z);if(d<r)hurt(e,95*(1-d/r)+5,g.owner===e?null:g.owner)}
+ const f=new THREE.Mesh(new THREE.SphereGeometry(r*.5,12,8),new THREE.MeshBasicMaterial({color:0xff8c2a,transparent:true,opacity:.7}));f.position.set(g.x,g.y,g.z);scene.add(f);tracers.push({ln:f,t:now+.25});tone(55,.5,'sawtooth',.12)}
+function updG(dt){for(let k=grens.length-1;k>=0;k--){const g=grens[k];g.vy-=26*dt;g.x+=g.vx*dt;g.y+=g.vy*dt;g.z+=g.vz*dt;
+ if(g.y<.25){g.y=.25;g.vy*=-.35;g.vx*=.6;g.vz*=.6}push(g,.25);g.m.position.set(g.x,g.y,g.z);
+ if(now>=g.t){boom(g);scene.remove(g.m);grens.splice(k,1)}}}
+function reload(){if(pl.rl||pl.mag[pl.cur]>=WP[pl.cur].mag||pl.res[pl.cur]<=0)return;pl.rl=now+WP[pl.cur].rl;toast('Reload...')}
+function sw(n){if(!pl.have[n]||pl.cur===n)return;pl.cur=n;pl.rl=0;tone(400,.06,'triangle',.06)}
+function swNext(){const i=ORDER.indexOf(pl.cur);for(let k=1;k<=3;k++){const n=ORDER[(i+k)%3];if(pl.have[n]){sw(n);return}}}
+function jump(){if(pl.y<=0.01&&!pl.dead)pl.vy=9}
+function pickups(){for(let k=items.length-1;k>=0;k--){const it=items[k];if(Math.hypot(pl.x-it.x,pl.z-it.z)>2.2)continue;
+ if(it.type==='med'){if(pl.hp>=100)continue;pl.hp=Math.min(100,pl.hp+40);toast('+40 HP')}
+ else if(it.type==='arm'){if(pl.sh>=100)continue;pl.sh=Math.min(100,pl.sh+50);toast('+50 Armor')}else if(it.type==='gren'){pl.gr+=2;toast('Granat +2')}else if(it.type==='ammo'){for(const n of ORDER)pl.res[n]+=WP[n].mag*2;toast('Amunisi +')}
+ else{if(!pl.have[it.type]){pl.have[it.type]=true;pl.mag[it.type]=WP[it.type].mag;pl.res[it.type]=WP[it.type].mag*2;sw(it.type);toast('Senjata baru: '+WP[it.type].n)}else{pl.res[it.type]+=WP[it.type].mag*2;toast('Amunisi '+WP[it.type].n)}}
+ tone(700,.1,'triangle',.07);scene.remove(it.mesh);items.splice(k,1)}}
+
+function stepEnt(e,dx,dz,sp,dt){e.x+=dx*sp*dt;e.z+=dz*sp*dt;push(e,.6);
+ if(e.para){e.y-=14*dt;e.vy=0;if(e.y<=0){e.y=0;e.para=false;if(!e.bot)toast('Mendarat! Cari senjata di sekitar rumah')}}else{e.vy-=26*dt;e.y+=e.vy*dt;if(e.y<0){e.y=0;e.vy=0}}}
+function botAI(b,dt){let tgt=null,bd=55;for(const o of [pl,...bots]){if(o===b||o.dead||o.para)continue;const d=Math.hypot(o.x-b.x,o.z-b.z);if(d<bd){bd=d;tgt=o}}
+ const zd=Math.hypot(b.x-Z.x,b.z-Z.z),out=zd>Z.r-8;let mx=0,mz=0,sp=5;
+ if(tgt&&!out){const a=Math.atan2(tgt.x-b.x,tgt.z-b.z);b.yaw=a+Math.PI;const pref=b.w==='shotgun'?10:b.w==='pistol'?20:30,f=bd>pref+4?1:bd<pref-6?-1:0,s=Math.sin(now*1.2+b.sd*2);
+  mx=Math.sin(a)*f+Math.cos(a)*s*.8;mz=Math.cos(a)*f-Math.sin(a)*s*.8;
+  if(now>b.next&&bd<Math.min(WP[b.w].rg*.6,50)){b.next=now+WP[b.w].r*(b.w==='rifle'?2.4:2.8)+rnd(0,.4);
+   const o=new V(b.x,b.y+1.4,b.z),d=new V(tgt.x,tgt.y+1.1,tgt.z).sub(o).normalize();shoot(o,d,b.w,b,.04+bd*.0016,tgt===pl?.55:.8)}}
+ else{b.tt-=dt;if(b.tt<=0||Math.hypot(b.tx-b.x,b.tz-b.z)<3){b.tt=rnd(4,9);
+   if(out){b.tx=Z.x+rnd(-.4,.4)*Z.r;b.tz=Z.z+rnd(-.4,.4)*Z.r}else{b.tx=cl(b.x+rnd(-80,80),-370,370);b.tz=cl(b.z+rnd(-80,80),-370,370)}}
+  const a=Math.atan2(b.tx-b.x,b.tz-b.z);mx=Math.sin(a);mz=Math.cos(a);b.yaw=a+Math.PI;sp=out?8:4.5}
+ if(tgt&&!out&&bd>12&&bd<30&&now>(b.gn||0)&&Math.random()<.004){b.gn=now+9;grenade(new V(b.x,b.y+1.5,b.z),new V(tgt.x-b.x,0,tgt.z-b.z).normalize().multiplyScalar(Math.min(bd,28)*1.45).add(new V(0,6,0)),b)}
+ stepEnt(b,mx,mz,sp,dt);b.mesh.position.set(b.x,b.y,b.z);b.mesh.rotation.y=b.yaw}
+
+const R=[280,180,100,50,18];
+function update(dt){
+ zt+=dt;const ph=Math.min(phase,4);
+ if(zm==='wait'&&zt>=25){zm='shrink';zt=0;zFrom={...Z};const r=R[ph],a=rnd(0,6.28),o=Math.max(0,Z.r-r)*rnd(.2,.7);zTo={x:cl(Z.x+Math.cos(a)*o,-370+r,370-r),z:cl(Z.z+Math.sin(a)*o,-370+r,370-r),r}}
+ if(zm==='shrink'){const k=Math.min(1,zt/20);Z.x=zFrom.x+(zTo.x-zFrom.x)*k;Z.z=zFrom.z+(zTo.z-zFrom.z)*k;Z.r=zFrom.r+(zTo.r-zFrom.r)*k;if(k>=1){zm='wait';zt=0;phase++}}
+ zoneM.position.x=Z.x;zoneM.position.z=Z.z;zoneM.scale.set(Z.r,1,Z.r);
+ $('zmsg').textContent=zm==='wait'?`Zona menyusut dalam ${Math.max(0,Math.ceil(25-zt))} dtk`:'Zona menyusut! Masuk lingkaran';
+ if(!pl.dead){
+  let mx=(keys.d?1:0)-(keys.a?1:0)+jx,mz=(keys.w?1:0)-(keys.s?1:0)-jy;const m=Math.hypot(mx,mz);if(m>1){mx/=m;mz/=m}
+  const run=keys.shift||(touch&&m>.92),sp=run?10.5:6.2;
+  const fx=-Math.sin(yaw),fz=-Math.cos(yaw),rx=Math.cos(yaw),rz=-Math.sin(yaw);
+  stepEnt(pl,fx*mz+rx*mx,fz*mz+rz*mx,sp,dt);pl.yaw=yaw;
+  if(pl.rl&&now>=pl.rl){const w=WP[pl.cur],n=Math.min(w.mag-pl.mag[pl.cur],pl.res[pl.cur]);pl.mag[pl.cur]+=n;pl.res[pl.cur]-=n;pl.rl=0}
+  if(fireHeld&&!pl.para&&!pl.rl&&now>=pl.next){if(pl.mag[pl.cur]>0){const w=WP[pl.cur];pl.next=now+w.r;pl.mag[pl.cur]--;
+    const d=new V(0,0,-1).applyQuaternion(cam.quaternion),mz2=pl.mesh.position;
+    const mu=new V(pl.x-Math.sin(yaw)*.9+Math.cos(yaw)*.3,pl.y+1.3,pl.z-Math.cos(yaw)*.9-Math.sin(yaw)*.3);
+    shoot(cam.position.clone(),d,pl.cur,pl,0,1,mu);pitch+=.006}else reload()}
+  pickups()}
+ for(const b of bots)if(!b.dead)botAI(b,dt);
+ for(const e of [pl,...bots])if(!e.dead&&Math.hypot(e.x-Z.x,e.z-Z.z)>Z.r)hurt(e,(2+phase*2)*dt,null);
+ pl.can.visible=!!pl.para;pl.mesh.position.set(pl.x,pl.y,pl.z);pl.mesh.rotation.y=yaw;
+ for(const it of items){it.mesh.rotation.y+=dt*2;it.mesh.position.y=1+Math.sin(now*3+it.x)*.15}
+ for(let k=tracers.length-1;k>=0;k--)if(now>tracers[k].t){scene.remove(tracers[k].ln);tracers.splice(k,1)}
+ if(!pl.dead&&alive===1&&st==='play'){st='won';setTimeout(()=>end(true),900)}
+ updG(dt);
+ // kamera orang ketiga
+ const bx=Math.sin(yaw),bz=Math.cos(yaw),rx2=Math.cos(yaw),rz2=-Math.sin(yaw);
+ pitch=cl(pitch,-.9,.7);
+ cam.position.set(pl.x+bx*4+rx2*.9,pl.y+2.3-pitch*2.5,pl.z+bz*4+rz2*.9);cam.rotation.set(pitch,yaw,0);
+}
+const mc=$('mm').getContext('2d');
+function hud(){
+ $('al').textContent=alive;$('kl').textContent=kills;
+ $('hpb').style.width=pl.hp+'%';$('shb').style.width=pl.sh+'%';$('gr').textContent='💣 '+pl.gr;$('hpt').textContent=Math.ceil(pl.hp)+' HP';
+ const w=WP[pl.cur];$('wn').textContent=w.n+(pl.rl?' (reload)':'');$('am').textContent=pl.mag[pl.cur];$('rs').textContent='/ '+pl.res[pl.cur];
+ $('feed').innerHTML=feed.filter(f=>now-f.t<5).map(f=>f.s).join('<br>');
+ mc.clearRect(0,0,110,110);const s=55/400;mc.fillStyle='#4f9a5266';mc.beginPath();mc.arc(55,55,375*s,0,6.3);mc.fill();
+ mc.strokeStyle='#ff6b6b';mc.lineWidth=2;mc.beginPath();mc.arc(55+Z.x*s,55+Z.z*s,Z.r*s,0,6.3);mc.stroke();
+ mc.save();mc.translate(55+pl.x*s,55+pl.z*s);mc.rotate(-yaw);mc.fillStyle='#ffd23f';mc.beginPath();mc.moveTo(0,-6);mc.lineTo(4,4);mc.lineTo(-4,4);mc.fill();mc.restore()}
+function loop(t){requestAnimationFrame(loop);const dt=Math.min(.05,(t-last)/1000||0);last=t;now=t/1000;
+ if(st==='play'||st==='won'){update(dt);hud()}else if(pl){cam.position.set(Math.cos(now*.1)*60,28,Math.sin(now*.1)*60);cam.lookAt(0,5,0)}
+ renderer.render(scene,cam)}
+function begin(){init();st='play';pl.y=80;pl.para=true;pl.can.visible=true;toast('Terjun payung! Arahkan ke pulau dan mendarat');$('ov').style.display='none';$('hud').style.display='block';if(touch)$('touch').style.display='block';tone(440,.15,'triangle',.08);
+ if(!touch)$('g').requestPointerLock&&$('g').requestPointerLock()}
+function end(win){if(st==='menu')return;st='menu';fireHeld=false;if(document.exitPointerLock)document.exitPointerLock();
+ $('hud').style.display='none';$('touch').style.display='none';$('ov').style.display='flex';$('bigv').style.display='block';
+ $('bigv').textContent=win?'🏆 JUARA #1':'#'+(pl.rank||alive+1);
+ $('sub').textContent=win?`Kamu bertahan paling akhir dengan ${kills} kill.`:`Kamu tersingkir di peringkat ${pl.rank} dengan ${kills} kill. Cari senjata lebih cepat dan jaga posisi di dalam zona.`;
+ $('play').textContent='MAIN LAGI'}
+
+// input PC
+addEventListener('keydown',e=>{const k=e.key.toLowerCase();keys[k]=true;if(st!=='play')return;
+ if(k===' ')jump();if(k==='r')reload();if(k==='q')swNext();if(k==='g')throwG();if(k==='1')sw('pistol');if(k==='2')sw('shotgun');if(k==='3')sw('rifle')});
+addEventListener('keyup',e=>keys[e.key.toLowerCase()]=false);
+addEventListener('mousemove',e=>{if(st==='play'&&document.pointerLockElement){yaw-=e.movementX*.0025*SENS();pitch-=e.movementY*.0025*SENS()}});
+$('g').addEventListener('mousedown',()=>{if(touch||st!=='play')return;if(!document.pointerLockElement)$('g').requestPointerLock();else fireHeld=true});
+addEventListener('mouseup',()=>{if(!touch)fireHeld=false});
+// input HP
+(function(){const z=$('jz'),b=$('jb'),k=$('jk');let pid=null,sx,sy;
+ z.addEventListener('pointerdown',e=>{if(pid!==null)return;pid=e.pointerId;z.setPointerCapture(pid);sx=e.clientX;sy=e.clientY;b.style.display=k.style.display='block';b.style.left=k.style.left=sx+'px';b.style.top=k.style.top=sy+'px'});
+ z.addEventListener('pointermove',e=>{if(e.pointerId!==pid)return;let dx=e.clientX-sx,dy=e.clientY-sy;const m=Math.hypot(dx,dy),c=Math.min(m,55);dx=m?dx/m*c:0;dy=m?dy/m*c:0;k.style.left=sx+dx+'px';k.style.top=sy+dy+'px';jx=dx/55;jy=dy/55});
+ const up=e=>{if(e.pointerId!==pid)return;pid=null;b.style.display=k.style.display='none';jx=jy=0};z.addEventListener('pointerup',up);z.addEventListener('pointercancel',up);
+ const l=$('lz');let lp=null,lx,ly;
+ l.addEventListener('pointerdown',e=>{if(lp!==null)return;lp=e.pointerId;l.setPointerCapture(lp);lx=e.clientX;ly=e.clientY});
+ l.addEventListener('pointermove',e=>{if(e.pointerId!==lp)return;yaw-=(e.clientX-lx)*.006*SENS();pitch-=(e.clientY-ly)*.005*SENS();lx=e.clientX;ly=e.clientY});
+ const lu=e=>{if(e.pointerId===lp)lp=null};l.addEventListener('pointerup',lu);l.addEventListener('pointercancel',lu);
+ const bf=$('bf');bf.addEventListener('pointerdown',e=>{e.stopPropagation();fireHeld=true});['pointerup','pointercancel','pointerleave'].forEach(n=>bf.addEventListener(n,()=>fireHeld=false));
+ $('bj').addEventListener('pointerdown',()=>jump());$('br').addEventListener('pointerdown',()=>reload());$('bs').addEventListener('pointerdown',()=>swNext());$('bg').addEventListener('pointerdown',()=>throwG())})();
+$('play').onclick=begin;$('snd').onclick=()=>{sound=!sound;$('snd').textContent=sound?'🔊 Suara: nyala':'🔇 Suara: mati'};
+$('dl').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([SRC],{type:'text/html'}));a.download='battle-royale-last-survivor.html';document.body.appendChild(a);a.click();a.remove()};
+init();requestAnimationFrame(loop);
+}
+</script></body></html>
